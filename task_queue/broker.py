@@ -20,6 +20,7 @@ KEY_DEAD_LETTER = "tq:dead_letter"
 KEY_RESULT = "tq:result:{task_id}"
 KEY_RESULT_CHANNEL = "tq:result_channel"
 KEY_CRON_TASKS = "tq:cron_tasks"
+KEY_ALL_TASKS = "tq:all_tasks"
 
 PRIORITY_ORDER = [TaskPriority.CRITICAL, TaskPriority.HIGH, TaskPriority.NORMAL, TaskPriority.LOW]
 
@@ -45,17 +46,16 @@ class Broker:
         if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
             self._stop_event.clear()
             try:
-                self._process_delayed_tasks()
-                self._process_timed_out_tasks()
+                self._ensure_consistency()
             except Exception as e:
-                logger.exception("Startup recovery scan error: %s", e)
+                logger.exception("Startup consistency check error: %s", e)
             self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
             self._scheduler_thread.start()
             self._reaper_thread = threading.Thread(target=self._reaper_loop, daemon=True)
             self._reaper_thread.start()
             self._cron_thread = threading.Thread(target=self._cron_loop, daemon=True)
             self._cron_thread.start()
-            logger.info("Broker background threads started (recovery scan completed)")
+            logger.info("Broker background threads started (consistency check completed)")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -66,7 +66,10 @@ class Broker:
 
     def save_task(self, task: Task) -> None:
         task.touch()
-        self.redis.set(self._k(KEY_TASK.format(task_id=task.task_id)), task.to_json())
+        pipe = self.redis.pipeline()
+        pipe.set(self._k(KEY_TASK.format(task_id=task.task_id)), task.to_json())
+        pipe.sadd(self._k(KEY_ALL_TASKS), task.task_id)
+        pipe.execute()
 
     def get_task(self, task_id: str) -> Optional[Task]:
         data = self.redis.get(self._k(KEY_TASK.format(task_id=task_id)))
@@ -115,6 +118,65 @@ class Broker:
             except Exception as e:
                 logger.exception("Scheduler loop error: %s", e)
             self._stop_event.wait(0.5)
+
+    def _ensure_consistency(self) -> None:
+        logger.info("Starting consistency check across all tasks...")
+        all_task_ids = self.redis.smembers(self._k(KEY_ALL_TASKS))
+
+        ready_ids = set()
+        for priority in PRIORITY_ORDER:
+            queue_key = self._k(KEY_QUEUE.format(priority=int(priority)))
+            ready_ids.update(self.redis.lrange(queue_key, 0, -1))
+
+        delayed_ids = set(self.redis.zrange(self._k(KEY_DELAYED), 0, -1))
+        processing_ids = set(self.redis.zrange(self._k(KEY_PROCESSING), 0, -1))
+        dead_letter_ids = set(self.redis.lrange(self._k(KEY_DEAD_LETTER), 0, -1))
+
+        fixed_count = 0
+        now = time.time()
+
+        for task_id in all_task_ids:
+            task = self.get_task(task_id)
+            if task is None:
+                continue
+
+            if task.status == TaskStatus.DELAYED:
+                if task.scheduled_at <= now:
+                    task.status = TaskStatus.READY
+                    self.save_task(task)
+                    queue_key = self._k(KEY_QUEUE.format(priority=int(task.priority)))
+                    self.redis.lpush(queue_key, task_id)
+                    self.redis.zrem(self._k(KEY_DELAYED), task_id)
+                    fixed_count += 1
+                    logger.info("[consistency] Task %s was DELAYED but expired, moved to ready queue", task_id)
+                elif task_id not in delayed_ids:
+                    self.redis.zadd(self._k(KEY_DELAYED), {task_id: task.scheduled_at})
+                    fixed_count += 1
+                    logger.info("[consistency] Task %s was DELAYED but missing from ZSet, restored", task_id)
+
+            elif task.status == TaskStatus.READY:
+                if task_id not in ready_ids:
+                    queue_key = self._k(KEY_QUEUE.format(priority=int(task.priority)))
+                    self.redis.lpush(queue_key, task_id)
+                    fixed_count += 1
+                    logger.info("[consistency] Task %s was READY but missing from queue, restored", task_id)
+
+            elif task.status == TaskStatus.PROCESSING:
+                if task_id not in processing_ids:
+                    task.retry_count += 1
+                    task.error_message = "recovered from crash during processing"
+                    logger.warning("[consistency] Task %s was PROCESSING but missing from ZSet, retry %d/%d",
+                                   task_id, task.retry_count, task.max_retries)
+                    self._handle_retry_or_dead_letter(task, task.error_message)
+                    fixed_count += 1
+
+            elif task.status == TaskStatus.DEAD_LETTER:
+                if task_id not in dead_letter_ids:
+                    self.redis.lpush(self._k(KEY_DEAD_LETTER), task_id)
+                    fixed_count += 1
+                    logger.info("[consistency] Task %s was DEAD_LETTER but missing from DLQ, restored", task_id)
+
+        logger.info("Consistency check completed, fixed %d / %d tasks", fixed_count, len(all_task_ids))
 
     def _process_delayed_tasks(self) -> None:
         now = time.time()
