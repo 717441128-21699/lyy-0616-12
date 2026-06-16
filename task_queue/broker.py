@@ -25,8 +25,12 @@ PRIORITY_ORDER = [TaskPriority.CRITICAL, TaskPriority.HIGH, TaskPriority.NORMAL,
 
 
 class Broker:
-    def __init__(self, redis_url: str = "redis://localhost:6379/0", namespace: str = "tq"):
-        self.redis = redis.Redis.from_url(redis_url, decode_responses=True)
+    def __init__(self, redis_url: str = "redis://localhost:6379/0", namespace: str = "tq",
+                 redis_client: Optional[redis.Redis] = None):
+        if redis_client is not None:
+            self.redis = redis_client
+        else:
+            self.redis = redis.Redis.from_url(redis_url, decode_responses=True)
         self.namespace = namespace
         self._stop_event = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
@@ -40,13 +44,18 @@ class Broker:
     def start_background_threads(self) -> None:
         if self._scheduler_thread is None or not self._scheduler_thread.is_alive():
             self._stop_event.clear()
+            try:
+                self._process_delayed_tasks()
+                self._process_timed_out_tasks()
+            except Exception as e:
+                logger.exception("Startup recovery scan error: %s", e)
             self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
             self._scheduler_thread.start()
             self._reaper_thread = threading.Thread(target=self._reaper_loop, daemon=True)
             self._reaper_thread.start()
             self._cron_thread = threading.Thread(target=self._cron_loop, daemon=True)
             self._cron_thread.start()
-            logger.info("Broker background threads started")
+            logger.info("Broker background threads started (recovery scan completed)")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -144,7 +153,10 @@ class Broker:
             task = self.get_task(task_id)
             if task is None:
                 continue
-            logger.warning("Task %s timed out (worker %s), re-queuing", task_id, task.worker_id)
+            task.retry_count += 1
+            task.error_message = "visibility timeout exceeded"
+            logger.warning("Task %s timed out (worker %s), retry %d/%d",
+                           task_id, task.worker_id, task.retry_count, task.max_retries)
             self._handle_retry_or_dead_letter(task, "visibility timeout exceeded")
 
     def fetch_task(self, worker_id: str, timeout_seconds: int = 300) -> Optional[Task]:
@@ -209,8 +221,17 @@ class Broker:
 
         if task.retry_count >= task.max_retries:
             task.status = TaskStatus.DEAD_LETTER
+            task.finished_at = time.time()
             self.save_task(task)
             self.redis.lpush(self._k(KEY_DEAD_LETTER), task.task_id)
+            final_result = TaskResult(
+                task_id=task.task_id,
+                success=False,
+                error=error,
+                retry_count=task.retry_count,
+            )
+            self.redis.set(self._k(KEY_RESULT.format(task_id=task.task_id)), final_result.to_json())
+            self.redis.publish(self._k(KEY_RESULT_CHANNEL), final_result.to_json())
             logger.error("Task %s moved to dead letter queue after %d retries. Error: %s",
                          task.task_id, task.retry_count, error)
             return

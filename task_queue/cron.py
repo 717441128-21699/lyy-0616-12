@@ -9,7 +9,7 @@ class CronParser:
         (0, 23),
         (1, 31),
         (1, 12),
-        (0, 6),
+        (0, 7),
     ]
     _FIELD_NAMES = ["minute", "hour", "day", "month", "weekday"]
 
@@ -20,7 +20,20 @@ class CronParser:
         self.expression = expression
         self.fields: List[Set[int]] = []
         for i, part in enumerate(parts):
-            self.fields.append(self._parse_field(part, *self._FIELD_RANGES[i]))
+            values = self._parse_field(part, *self._FIELD_RANGES[i])
+            if i == 4:
+                values = self._normalize_weekday(values)
+            self.fields.append(values)
+
+    @classmethod
+    def _normalize_weekday(cls, values: Set[int]) -> Set[int]:
+        normalized: Set[int] = set()
+        for v in values:
+            if v == 0 or v == 7:
+                normalized.add(7)
+            else:
+                normalized.add(v)
+        return normalized
 
     @classmethod
     def _parse_field(cls, expr: str, min_val: int, max_val: int) -> Set[int]:
@@ -56,13 +69,18 @@ class CronParser:
             raise ValueError(f"Value out of range [{min_val}, {max_val}]: {expr}")
         return set(range(start, end + 1))
 
+    @classmethod
+    def _python_weekday_to_cron(cls, py_wd: int) -> int:
+        return py_wd + 1
+
     def matches(self, dt: datetime) -> bool:
+        cron_weekday = self._python_weekday_to_cron(dt.weekday())
         return (
             dt.minute in self.fields[0]
             and dt.hour in self.fields[1]
             and dt.day in self.fields[2]
             and dt.month in self.fields[3]
-            and dt.weekday() in self.fields[4]
+            and cron_weekday in self.fields[4]
         )
 
     def next_run_after(self, after: Optional[datetime] = None) -> datetime:
