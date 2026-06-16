@@ -171,10 +171,28 @@ class Broker:
                     fixed_count += 1
 
             elif task.status == TaskStatus.DEAD_LETTER:
+                needs_fix = False
                 if task_id not in dead_letter_ids:
                     self.redis.lpush(self._k(KEY_DEAD_LETTER), task_id)
-                    fixed_count += 1
+                    needs_fix = True
                     logger.info("[consistency] Task %s was DEAD_LETTER but missing from DLQ, restored", task_id)
+                result_key = self._k(KEY_RESULT.format(task_id=task_id))
+                if not self.redis.exists(result_key):
+                    error = task.error_message or "task failed and moved to dead letter (recovered after crash)"
+                    final_result = TaskResult(
+                        task_id=task.task_id,
+                        success=False,
+                        error=error,
+                        retry_count=task.retry_count,
+                        executed_at=task.finished_at or time.time(),
+                    )
+                    self.redis.set(result_key, final_result.to_json())
+                    self.redis.publish(self._k(KEY_RESULT_CHANNEL), final_result.to_json())
+                    needs_fix = True
+                    logger.warning("[consistency] Task %s was DEAD_LETTER but missing result, backfilled: %s",
+                                   task_id, error)
+                if needs_fix:
+                    fixed_count += 1
 
         logger.info("Consistency check completed, fixed %d / %d tasks", fixed_count, len(all_task_ids))
 
